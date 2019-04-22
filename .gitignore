@@ -1,0 +1,12 @@
+*~
+*#
+*.swp
+*.tmp
+*.bak
+*.tdy
+*.tar.gz
+*.tgz
+*.orig
+
+Commitlog
+
