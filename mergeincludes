@@ -1,0 +1,373 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+my $copyright = << 'COPYRIGHT';
+Copyright (C) 2019 Timothe Litt <litt at acm.org>
+Use --man for license information.
+COPYRIGHT
+
+our $VERSION = '0.001';
+
+# Iterate over in-use config file, with listing or command execution.
+
+my $server_root = '/etc/httpd';
+my $default_file = 'conf/httpd.conf';
+
+use Cwd( qw/realpath getcwd/ );
+use File::Basename;
+use File::Spec;
+use Getopt::Long( qw/:config bundling/ );
+
+sub process;
+
+my $prog = basename( $0, qw/.pl/ );
+
+my $number = 1;
+my $xit    = 0;
+my $chdir  = 1;
+
+my( $man, $only, $root, @execute, $continue, $quiet, $help, $version );
+GetOptions( 'number|n!'            => \$number,
+            'chdir|C!'             => \$chdir,
+            'execute|e=s'          => \@execute,
+            'continue-on-errors|c' => \$continue,
+            'quiet|q!'             => \$quiet,
+            'only-includes|i!'     => \$only,
+            'root|d|r=s'           => \$root,
+            'help|?'               => \$help,
+            'man'                  => \$man,
+            'version|v'            => \$version, ) or
+    die( "Command line error\n" );
+
+if( $version ) {
+    print( "$prog version $VERSION\n$copyright" );
+    exit( 0 );
+}
+
+if( $help || $man ) {
+    eval { require Pod::Usage } or do {
+        print STDERR ( "Install Pod::Usage or use 'perldoc $prog'\n" );
+        exit( 1 );
+    };
+    Pod::Usage::pod2usage( -verbose => 1 ) if $help;
+    Pod::Usage::pod2usage( -verbose => 2 ) if $man;
+}
+
+if( defined $root ) {
+    $server_root = $root;
+} elsif( defined( my $cfg = qx,httpd -V -f /dev/null 2>/dev/null, ) ) { # Get from httpd, suppress "no MPM"
+    if( defined $cfg ) {
+        my( undef, $cr ) = $cfg =~ /^\s*-D\s*HTTPD_ROOT=(["'])?((?:\\\1|[^\1]\n)+?)\1\n/ms;
+        my( undef, $cf ) = $cfg =~ /^\s*-D\s*SERVER_CONFIG_FILE=(["'])?((?:\\\1|[^\1\n])+?)\1\n/ms;
+        $server_root = $cr if( $cr );
+        push @ARGV, $cf if( $cf && !@ARGV );
+    }
+} elsif( @ARGV && $ARGV[0] ne '-' && File::Spec->file_name_is_absolute( $ARGV[0] ) ) {
+    $server_root = dirname( $ARGV[0] );
+}
+push @ARGV, $default_file unless( @ARGV );
+
+printf( "#%s by %s %s\n# Base directory:%s\n\n", join( ' ', @ARGV ), $prog,
+        scalar localtime,                        $server_root)
+    unless( $only || $quiet );
+
+while( @ARGV ) {
+    my $fn = shift;
+
+    my @f = glob $fn;
+    while( @f ) {
+        my $pn = shift @f;
+
+        my $root = $server_root;
+        my( $rv, $idt ) = process( $pn, $root, 0 );
+        $xit ||= $rv;
+        unless( $quiet ) {
+            print( $idt ) if( $number );
+            printf( "#-%s\n", $pn );
+        }
+    }
+}
+exit( $xit || 0 );
+
+sub process {
+    my( $fn, $root, $depth, $optional ) = @_;
+
+    die( "Include from a directory ($fn) is not supported\n" ) if( -d $fn );
+
+    my $indent = sprintf( "%2u: %s", $depth, ' ' x $depth );
+
+    print( $indent ) if( $number && !$quiet );
+    printf( "#+%s", $fn ) unless( $quiet );
+
+    my( $fh, $rp );
+    if( $fn eq '-' ) {
+        $fh = \*stdin;
+    } else {
+        unless( File::Spec->file_name_is_absolute( $fn ) ) {
+            $fn = File::Spec->catfile( $root, $fn );
+        }
+        open( $fh, '<', $fn ) or do {
+            unless( $quiet ) {
+                print( " (optional)" ) if( $optional );
+                print( "\n", $indent, "$fn: $!\n" );
+            }
+            print STDERR ( "\n", $indent, "$fn: $!\n" );
+            return ( 1, $indent );
+        };
+        $rp = realpath( $fn );
+        printf( ' => %s', $rp ) if( !$quiet && ( $rp ne $fn || $rp ne $_[0] ) );
+    }
+    unless( $quiet ) {
+        print( " (optional)" ) if( $optional );
+        print( "\n" );
+    }
+
+    foreach my $execute ( @execute ) {
+        my $cmd = $execute;
+        my $rc;
+        if( $rp && $chdir ) {
+            my $wd = getcwd;
+            my $xd = dirname( $fn );
+            chdir( $xd ) or die( "$xd: $!\n" );
+            my $xn = basename( $fn );
+            $cmd =~ s/\{\}/$xn/g;
+            $rc = system( $cmd );
+            local $!;
+            chdir( $wd ) or die( "$wd: $!\n" );
+        } else {
+            my $xp = $fn;
+            $cmd =~ s/\{\}/$fn/g;
+            $rc = system( $cmd );
+        }
+        unless( $rc == 0 ) {
+            if( $? == -1 ) {
+                printf STDERR ( "%s: failed to execute: %s\n", $cmd, $! );
+            } elsif( $? & 127 ) {
+                printf STDERR (
+                    "%s: died with signal %d, %s coredump\n", $cmd,
+                    ( $? & 127 ), ( $? & 128 ) ? 'with' : 'without' );
+            } else {
+                printf STDERR ( "%s: exited with status %d\n", $cmd, $? >> 8 );
+            }
+            exit( $? >> 8 ) unless( $continue );
+        }
+        $xit ||= $? >> 8;
+    }
+
+    my $line = '';
+    while( <$fh> ) {
+        $_ .= "\n" unless( substr( $_, -1, 1 ) eq "\n" );
+        if( $number && !@execute ) {
+            printf( "$indent%4u:%s", $., $_ );
+        } else {
+            print;
+        }
+        s/\015?\012//;         # chomp (with cr)
+        $line =~ s/\\?\z/$_/;  # Remove continuation & append new
+        next if( s/\\\z// );   # This line a continuation.
+        $_ = $line;            # Expanded line, not continued
+        $line = '';            # Initialize next line
+        next if( /^\s*#/ );    # Comment (httpd comments ARE continued.)
+        next if( /^\s*$/ );    # Blank
+
+        if( /^\s*ServerRoot\s+(["'}?])([^\1]*)\1\s*$/i ) {
+            $_[1] = $root = $2;
+            next;
+        }
+        my $inc;
+        /^\s*Include(Optional)?\s+(["'}?])([^\2]*)\2\s*$/i and
+            $inc = $3 or
+            /^\s*Include\s+(\S+)s*$/i and
+            $inc = $1;
+        my $opt = $1;
+
+        if( defined $inc ) {
+            foreach my $pn ( glob $inc ) {
+                my( $rv, $idt ) = process( $pn, $root, $depth + 1, $opt );
+                $xit ||= $rv;
+                unless( $quiet ) {
+                    print( $idt ) if( $number );
+                    printf( "#-%s\n", $pn );
+                }
+            }
+            unless( $quiet ) {
+                print( $indent ) if( $number );
+                printf( "#=%s\n", $fn );
+            }
+        }
+    }
+    printf STDERR ( "%s: continuation open at end of file (line %u)\n", $fn, $. ) if( length $line && !$quiet );
+    close( $fh );
+    return ( 0, $indent );
+}
+
+__END__
+
+
+=pod
+
+=head1 NAME
+
+mergeincludes - Merges Include directives into a numbered output file
+
+=head1 SYNOPSIS
+
+ mergeincludes --root=DIR      --number  --help --man --version [file ...]
+               --only-includes --execute --continue   --chdir
+
+=head1 DESCRIPTION
+
+I<mergeincludes> follows the I<Include(Optional)> directives in an Apache-format
+configuration file.  It does not process conditionals, so the output
+is as if all conditionals are true.
+
+By default, produces a numbered output file with the merged contents.
+
+Optionally, instead of producing a numbered listing of the contents,
+it can simply list the files that it encounters.  Or it can  execute
+a specified command for each file - e.g. to edit the files.
+
+Both B<Include> and B<IncludeOptional> are recognized.  Explicit wildcards
+(e.g. conf/*.conf) will be followed, but a bare directory is an error.
+
+If no file is specified, I<httpd> is queried (using PATH), and its compiled-in default
+configuration filename is used.  If I<httpd> is not available,
+F<conf/httpd.conf> is assumed.
+
+The I<ServerRoot> directive is also recognized, and will be used to
+resolve any relative filenames encountered.  The default is the I<ServerRoot>
+compiled into the I<httpd> found on PATH, or if I<httpd> can't be executed,
+the path of the first file specified.  Finally, if no file is specified,
+or '-' is specified, F</etc/httpd>.
+
+=head1 OPTIONS
+
+The following options are provided.  The short and long forms of
+each option have the same effect.  The long form of a boolean
+option can be negated by specifying it as B<-->noB<OPTION>.
+
+=over 4
+
+=item B<n> B<--number> (default)
+
+Each line is identified by the nesting depth
+and line number.  B<--nonumber> to turn off.
+
+=item B<i> B<--only-includes>
+
+Only outputs the names of the included files; omits the other content.
+Useful for identifying which files are actually in use.
+
+=item B<e> B<--execute>=COMMAND
+
+Executes COMMAND for each file, substituting the filename for each {}
+in the command.  (Like find -exec).
+
+May be specified more than once; in that case, each command is
+executed in left-to-right order for each file.
+
+=item B<c> B<--continue-on-errors>
+
+With B<--execute>, if the command fails (fails to run, produces a
+non-zero exit status, or dies with signal), continue processing with
+the next file.  B<--no-continue-on-errors>, the default, stops on any
+of these errors.
+
+=item B<-C> B<--chdir>
+
+With B<--execute>, the command will be executed with the working
+directory set to that of the file.   The {} token will be replaced
+by the filename (without the path.) This is the default.
+
+With B<--nochdir> executes the command with the working directory
+unchanged.  In this case, the absolute path to the file will replace
+the {} token.  This is less secure.
+
+=item B<q> B<--quiet>
+
+Does not print the file header and trailer comments.
+
+E.g. mergeincludes --exec 'ls -l --color=always {}' is cluttered and
+redundant without B<--quiet>.
+
+=item B<r> B<--root>
+
+Specifies the root directory  used when a B<Include> directive
+specifies a relative path.  If a I<ServerRoot> directive is
+encountered, B<--root> has no subsequent effect on the files
+included, but does apply to each file specified on the command line.
+
+For compatibility with I<httpd>, B<-d> is also accepted.
+
+=item B<--help>
+
+Display summary usage information.
+
+=item B<--man>
+
+Display complete usage information.
+
+=item B<--version>
+
+Display version
+
+=back
+
+=head1 RETURN VALUE
+
+The exit value is 0 if no errors.
+
+=head1 FILES
+
+Only the input files are used.
+
+
+=head1 BUGS
+
+Report any bugs, feature requests and/or patches to the author.
+
+=head1 AUTHOR
+
+Timothe Litt  E<lt>litt@acm.orgE<gt>
+
+=head1 COPYRIGHT and LICENSE
+
+Copyright (c) 2019 Timothe Litt
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+Except as contained in this notice, the name of the author shall not be
+used in advertising or otherwise to promote the sale, use or other dealings
+in this Software without prior written authorization from the author.
+
+Any modifications to this software must be clearly documented by and
+attributed to their author, who is responsible for their effects.
+
+Bug reports, suggestions and patches are welcomed by the original author.
+
+=head1 SEE ALSO
+
+I<httpd(8)> I<fin(1)>
+
+=cut
+
+
+

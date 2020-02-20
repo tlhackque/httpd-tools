@@ -1,0 +1,863 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+my $copyright = << 'COPYRIGHT';
+Copyright (C) 2019 Timothe Litt <litt at acm.org>
+Use --man for license information.
+COPYRIGHT
+
+our $VERSION = '0.001';
+
+use File::Basename;
+use File::Spec;
+use Getopt::Long( qw/:config bundling/ );
+my $netdns = eval { require Net::DNS };
+use Socket( qw/2.000 :addrinfo IPPROTO_TCP/ );
+use POSIX( qw/strftime/ );
+my $readkey = eval { require Term::ReadKey };
+use Time::Local;
+use Text::Wrap;
+
+sub process;
+sub maxw;
+sub pentry;
+sub ddate;
+sub pdetail;
+sub phdrs;
+sub pbody;
+sub pmeta;
+sub usdelay;
+sub ustime;
+sub ptagged;
+sub ipname;
+
+my $prog = basename( $0, qw/.pl/ );
+
+my %months =
+    ( qw/Jan 0 Feb 1 Mar 2 Apr 3 May 4 Jun 5 Jul 6 Aug 7 Sep 8 Oct 9 Nov 10 Dec 11/ );
+
+my( $man, $help, $version, $ddate, $utc, $names, $msonly, @extract, %names, $ns );
+
+my $root = '/var/log/httpd';
+
+my $owid =
+    ( $readkey ? ( Term::ReadKey::GetTerminalSize() )[0] : 0 ) || $ENV{COLUMNS} || 132;
+
+GetOptions( 'root|r=s'              => \$root,
+            'date|d!'               => \$ddate,
+            'extract|e=s'           => \@extract,
+            'utc|u!'                => \$utc,
+            'hostnames|n!'          => \$names,
+            'only-modsec-events|m!' => \$msonly,
+            'width|w=i'             => \$owid,
+            'help|?'                => \$help,
+            'man'                   => \$man,
+            'version|v'             => \$version, ) or
+    die( "Command line error\n" );
+
+if( $version ) {
+    print( "$prog version $VERSION\n$copyright" );
+    exit( 0 );
+}
+
+if( $help || $man ) {
+    eval { require Pod::Usage } or do {
+        print STDERR ( "Install Pod::Usage or use 'perldoc $prog'\n" );
+        exit( 1 );
+    };
+    Pod::Usage::pod2usage( -verbose => 1 ) if $help;
+    Pod::Usage::pod2usage( -verbose => 2 ) if $man;
+}
+
+$owid = 80 if( $owid < 80 );
+$owid = 90 if( $ddate && $owid < 90 );
+
+if( @ARGV ) {
+    $root = dirname( $ARGV[0] ) unless( defined $root );
+} else {
+    push @ARGV, '-' unless( @ARGV );
+}
+
+# Setup to extract specific records by id
+
+my %wanted = map { $_ => 1 } ( map { split( /\s*,\s*/, $_ ) } @extract );
+
+my( $mthw, $ipw, $msgw, $urlw, $uidw ) = ( 0 ) x 5;
+
+# Process each input file
+# For summaries, there is a pre-print pass to optimize field widths
+
+for( my $pass = 0; $pass < ( @extract ? 1 : 2 ); $pass++ ) {
+    foreach my $file ( @ARGV ) {
+        my $fn = $file;
+
+        unless( $fn eq '-' || File::Spec->file_name_is_absolute( $fn ) ) {
+            $fn = File::Spec->catfile( $root, $fn );
+        }
+
+        foreach my $gf ( glob $fn ) {
+            unless( $gf eq '-' || File::Spec->file_name_is_absolute( $gf ) ) {
+                $gf = File::Spec->catfile( $root, $gf );
+            }
+
+            process( $gf, $pass );
+        }
+    }
+    if( $pass == 0 ) {
+        my $wid = $owid -
+            length( '1.0  200 960000    ' );  # 19 - httpver, rc, rid, intra-col spaces
+        $wid -= $uidw;
+        $wid -= 20 if( $ddate );
+        $wid -= $mthw;
+        if( $wid < $ipw + $msgw + $urlw ) {
+            if( $names ) {
+                $wid -= maxw( \$ipw, '1', 15 );
+            } else {
+                $wid -= $ipw;
+            }
+            if( $wid < $msgw + $urlw ) {
+                $wid = int( $wid / 2 );
+                $wid = 4 if( $wid < 4 );
+                maxw( \$msgw, '1', $wid );
+                maxw( \$urlw, '1', $wid );
+            }
+        }
+    }
+}
+
+# Process one file
+
+sub process {
+    my( $fn, $pass ) = @_;
+
+    my $fh;
+    if( $fn eq '-' ) {
+        $fh = \*stdin;
+    } else {
+        open( $fh, '<', $fn ) or do {
+            print STDERR ( "\n$fn: $!\n" );
+            return 1;
+        };
+    }
+
+    my( $marker, $part, $txt, %entry );
+
+    while( <$fh> ) {
+        chomp;
+
+        if( /^--([0-9a-f]+)-([A-Z])--$/ ) {
+            my( $m, $p ) = ( $1, $2 );
+            unless( $marker ) {
+                ( $marker, $part ) = ( $m, $p );
+                %entry = ();
+                next;
+            }
+            if( $m eq $marker ) {
+                if( $p eq 'Z' ) {
+                    pentry( \%entry, $pass );
+                    undef $marker;
+                    %entry = ();
+                    next;
+                }
+                $entry{$p} ||= '';
+                $part = $p;
+                next;
+            }
+            pentry( \%entry, $pass );
+            ( $marker, $part ) = ( $m, $p );
+            %entry = ( $part => '' );
+            next;
+        }
+        if( $marker ) {
+            $entry{$part} .= "$_\n";
+            next;
+        }
+    }
+    if( keys %entry ) {
+        pentry( \%entry, $pass );
+    }
+
+    close( $fh );
+
+    return 0;
+}
+
+# Update the maximum width of a field - up to a limit
+
+sub maxw {
+    my( $max, $str, $lim ) = @_;
+
+    my $l = length $str;
+    $$max = $l   if( $l > $$max );
+    $$max = $lim if( defined $lim && $$max > $lim );
+    return $$max;
+}
+
+# Print an entry when it's complete
+
+sub pentry {
+    my( $e, $pass ) = @_;
+
+    my $a = $e->{A} or return;
+    my( $date, $uid, $sip, $sport, $dip, $dport ) =
+        $a =~ /^\[([^\]]+)\]\s+(\S+)\s+(\S+)\s+(\d+)\s+(\S+)\s+(\d+)$/ or
+        return;
+
+    return if( @extract && !$wanted{$uid} );
+
+    return pdetail( $e, $date, $uid, $sip, $sport, $dip, $dport ) if( @extract );
+
+    my $trail = $e->{H} or return;
+
+    my $req = $e->{B} or return;
+    my( $meth, $url, $proto ) = $req =~ m/^(\S+)\s+(.+)\s+HTTP\/([\d.]+)$/ms or return;
+
+    my $rsp = $e->{F} or return;
+    my( $rc ) = $rsp =~ /\A\S+\s+(\d\d\d)/;
+
+    if( $trail =~ s{^Message: (.*?)$}{
+      my $txt = $1;
+      my( $id ) = $txt =~ /\[id "(\d+)"\]/;
+      my( $msg ) = $txt =~ /\[msg ["]((?:\\["]|[^"])*)["]\]/;
+
+      if( $id && $msg ) {
+          $sip = ipname( $sip );
+          if( $pass ) {
+              printf( "%s ", ddate( $date ) ) if( $ddate );
+              printf( "%-3s %-${mthw}s %3.3s %06d %-${ipw}.${ipw}s %-${msgw}.${msgw}s %-${urlw}.${urlw}s %s\n",
+                      $proto, $meth, $rc, $id, $sip, $msg, $url, $uid );
+          } else {
+              maxw( \$mthw, $meth, 8 );
+              maxw( \$ipw, $sip );
+              maxw( \$msgw, $msg );
+              maxw( \$urlw, $url );
+              maxw( \$uidw, $uid );
+          }
+      }
+      $txt
+  }egms
+        ) {
+        return;
+    } elsif(
+        !$msonly
+        && $trail =~ s{^(Apache-Error): (.*?)$}{
+        my $msg = ptagged( 0, $1, $2, 1 );
+
+          $sip = ipname( $sip );
+          if( $pass ) {
+              printf( "%s ", ddate( $date ) ) if( $ddate );
+              printf( "%-3s %-${mthw}s %3.3s ------ %-${ipw}.${ipw}s %-${msgw}.${msgw}s %-${urlw}.${urlw}s %s\n",
+                      $proto, $meth, $rc, $sip, $msg, $url, $uid );
+          } else {
+              maxw( \$mthw, $meth, 8 );
+              maxw( \$ipw, $sip );
+              maxw( \$msgw, $msg );
+              maxw( \$urlw, $url );
+              maxw( \$uidw, $uid );
+          }
+      }egms
+        ) {
+        return;
+    }
+}
+
+# Convert a logfile date into a display date
+
+sub ddate {
+    my( $date ) = @_;
+
+    $date = ( split( /\s+/, $date, 2 ) )[0];
+    my $t = $utc ? \&timegm : \&timelocal;
+    if( $date =~
+m,^([\d ]?\d)/([JFMASOND][aepuco][nbrylgptvc])/(\d{4}):(\d\d):(\d\d):(\d\d)(?:\.\d*)?$,
+        ) {
+        $date = strftime(
+            '%a %d-%b-%y %H:%M',
+            localtime( $t->( $6, $5, $4, $1, $months{$2}, $3 ) ) );
+    }
+    return $date;
+}
+
+# Print a detailed decode of a record
+
+sub pdetail {
+    my( $e, $date, $uid, $sip, $sport, $dip, $dport ) = @_;
+
+    if( $names ) {
+        my( $sn, $dn ) = ( ipname( $sip ), ipname( $dip ) );
+        if( $sn ne $sip || $dn ne $dip ) {
+            my( $sl, $dl ) = ( length( "$sip:$sport" ), length( "$dip:$dport" ) );
+            my $l = ( $sl > $dl ) ? $sl : $dl;
+            $sip = sprintf( "%-*s (%s)", $l, "$sip:$sport", $sn ) if( $sn ne $sip );
+            $dip = sprintf( "%-*s (%s)", $l, "$dip:$dport", $dn ) if( $dn ne $sip );
+        } else {
+            $sip = "$sip:$sport";
+            $dip = "$dip:$dport";
+        }
+    } else {
+        $sip = "$sip:$sport";
+        $dip = "$dip:$dport";
+    }
+    print( << "HDR" );
+
+Event ID: $uid
+Date    : $date
+Source  : $sip
+Target  : $dip
+HDR
+
+    if( $e->{B} ) {
+        print( "\n" );
+        phdrs( "Request headers", $e->{B} );
+    }
+
+    if( $e->{C} ) {
+        pbody( "Request body", $e->{C} );
+    }
+
+    if( $e->{F} ) {
+        print( "\n" );
+        phdrs( "Response headers", $e->{F} );
+    }
+
+    if( $e->{E} ) {
+        pbody( "Intended Response body", $e->{E} );
+    }
+    if( $e->{H} ) {
+        print( "\n" );
+        pmeta( "Metadata", $e->{H} );
+    }
+    if( $e->{I} ) {
+        print( "\n  Form data (Reduced)\n" );
+        my $val = $e->{I} or next;
+        $val =~ tr/\r\n//d;
+        my $w = 0;
+        foreach my $p ( split( /&/, $val ) ) {
+            if( my( $n, $v ) = split( /=/, $p, 2 ) ) {
+                $n =~ s/\+/ /g;
+                $n =~ s/%([[:xdigit:]]{2})/chr(hex($1))/eg;
+                $w = length( $n ) if( length $n > $w );
+            }
+        }
+        local
+            $Text::Wrap::columns  = $owid,
+            $Text::Wrap::unexpand = 0;
+
+        foreach my $p ( split( /&/, $val ) ) {
+            my $txt = '';
+            if( my( $n, $v ) = split( /=/, $p, 2 ) ) {
+                $n =~ s/\+/ /g;
+                $n =~ s/%([[:xdigit:]]{2})/chr(hex($1))/eg;
+                $txt .= sprintf( "    %-${w}.${w}s: ", $n );
+                if( defined $v ) {
+                    $v =~ s/\+/ /g;
+                    $v =~ s/%([[:xdigit:]]{2})/chr(hex($1))/eg;
+                } else {
+                    $v = '';
+                }
+                if( length $v && $v !~ /^\s+$/ ) {
+                    print( wrap( $txt, ( ' ' x ( 4 + $w + 2 ) ), $v ), "\n" );
+                } else {
+                    print( $txt, "\n" );
+                }
+            }
+        }
+    }
+
+    # J not implemented
+    if( $e->{K} ) {
+        print( "\n  Matched rules\n" );
+
+        # What's the format?
+
+    }
+    return;
+}
+
+# Print request or response headers
+
+sub phdrs {
+    my( $title, $hdrs ) = @_;
+
+    print( '  ', $title, "\n" );
+
+    my @h = split( /\r?\n/, $hdrs );
+
+    printf( "    %s\n", shift @h );
+
+    my $w = 0;
+    foreach my $h ( @h ) {
+        my( $n, $v ) = split( /:\s*/, $h, 2 );
+        $w = length $n if( length $n > $w );
+        $h = [ $n, $v ];
+    }
+
+    local
+        $Text::Wrap::columns  = $owid,
+        $Text::Wrap::unexpand = 0;
+
+    foreach my $h ( @h ) {
+
+        my $n = sprintf( "    %-*s: ", $w, $h->[0] );
+        print( wrap( $n, ( ' ' x ( 4 + $w + 2 ) ), $h->[1] ), "\n" );
+    }
+    return;
+}
+
+# Print a request or response body
+
+sub pbody {
+    my( $title, $body ) = @_;
+
+    print( '  ', $title, "\n" );
+
+    local
+        $Text::Wrap::columns  = $owid,
+        $Text::Wrap::unexpand = 0;
+    print( wrap( '    ', '    ', $body ), "\n" );
+
+    return;
+}
+
+# Print metadata record
+
+sub pmeta {
+    my( $title, $text ) = @_;
+
+    print( '  ', $title, "\n" );
+
+    local
+        $Text::Wrap::columns  = $owid,
+        $Text::Wrap::unexpand = 0;
+
+    my @lines = split( /\r?\n/, $text );
+    foreach my $l ( @lines ) {
+        my( $n, $v ) = split( /:\s*/, $l, 2 );
+
+        if( $n =~ /^(Message|Apache-Error)$/ ) {
+            print( ptagged( 4, $1, $v ) );
+            next;
+        }
+
+        # Not tagged - but plain values are handled
+        if( $n =~ /^(Apache-Handler|Producer|Server|Engine-Mode|Action|
+                     Response-Body-Transformed|WebApp-Info|
+                     Sanitised-(?:Args|(?:Request|Response)-Headers))$/x
+            ) {
+            print( ptagged( 4, $1, $v ) );
+            next;
+        }
+
+        # Stopwatch
+        if( $n =~ /^Stopwatch$/ ) {
+            my $sw2 = $1;
+            my( $start, $dur, $p2sdelay, $ps22, $p2edelay, $p2edelay2, $rqtime,
+                $rqtime2 );
+            my $txt = sprintf( "    %-16s: ", $n );
+            my $w   = ' ' x length( $txt );
+            my $on  = qr/(?:(?:(\d+)(\*?))|-)/;
+            if( $v =~ /^(\d+)\s+(\d+)\s+\($on\s+$on\s+$on\)/ ) {
+                $start     = $1;
+                $dur       = $2;
+                $p2sdelay  = $3;
+                $ps22      = $4;
+                $p2edelay  = $5;
+                $p2edelay2 = $6;
+                $rqtime    = $7;
+                $start     = ustime( $start );
+                $txt .= sprintf( "Start: %s, Duration: %s", $start, usdelay( $dur ) );
+
+                if( defined $p2sdelay ) {
+                    $txt .=
+                        sprintf( ", Phase 2 start: %s%s", usdelay( $p2sdelay ), $ps22 );
+                }
+                if( defined $p2edelay ) {
+                    $txt .= sprintf( ", Phase 2 end: %s%s", usdelay( $p2edelay ),
+                                     $p2edelay2 );
+                }
+                if( defined $rqtime ) {
+                    $txt .=
+                        sprintf( ", Response: %u.%s%s", usdelay( $rqtime ), $rqtime2 );
+                }
+                print( wrap( '', $w, $txt, "\n" ) );
+            } else {
+                print( wrap( $txt, $w, $v ), "\n" );
+            }
+            next;
+        }
+        if( $n =~ /^Stopwatch2$/ ) {
+            my $sw2 = $1;
+            my( $start, $dur, $p2sdelay, $tags );
+            my $txt = sprintf( "    %-16s: ", $n );
+            my $w   = ' ' x length( $txt );
+            if( $v =~ /^(\d+)\s+(\d+);(.*)$/ ) {
+                $start = $1;
+                $dur   = $2;
+                $tags  = $3;
+                $start = ustime( $start );
+                $txt .= sprintf( "Start: %s, Duration: %s", $start, usdelay( $dur ) );
+                if( defined $tags ) {
+                    foreach my $p ( split /,\s*/, $tags ) {
+                        if( my( $t, $v ) = $p =~ /^([^=]+)=(\d+)$/ ) {
+                            $txt .= sprintf( "%s=%s, ", $t, usdelay( $v ) );
+                        }
+                    }
+                    $txt =~ s/, $//;
+                }
+                print( wrap( '', $w, $txt, "\n" ) );
+            } else {
+                print( wrap( $txt, $w, $v ), "\n" );
+            }
+            next;
+        }
+
+        # Unknown
+        my $txt = sprintf( "    %-16s: ", $n );
+        my $w   = ' ' x length( $txt );
+        print( wrap( $txt, $w, $v ), "\n" );
+    }
+}
+
+# Time in usec to text (secs)
+
+sub usdelay {
+    my( $us ) = @_;
+    return '0' if( $us == 0 );
+    my( $s, $u ) = ( int( $us / 1_000_000 ), int( $us % 1_000_000 ) );
+
+    return sprintf( "%u.%06u", $s, $u );
+}
+
+# Time of day in usec to text (local time)
+
+sub ustime {
+    my( $us ) = @_;
+    my( $s, $u ) = ( int( $us / 1_000_000 ), int( $us % 1_000_000 ) );
+
+    my $t = strftime( '%d-%b-%Y %T.', localtime( $s ) );
+    $t .= sprintf( "%06u", $u );
+    return $t;
+}
+
+# Decode a (possibly) tagged value
+# May contain tags, quoted strings, and/or unquoted strings.
+
+sub ptagged {
+    my( $indent, $title, $value, $notags ) = @_;
+
+    my $text = '';
+    my $id   = ' ' x $indent;
+    $text .= join( $id, $title, "\n" );
+
+    my $dblenc = $title =~ /^Apache-Error$/i;
+    $id .= '  ';
+    my $id2 = $id . ( ' ' x ( 14 + 2 ) );
+
+    if( $notags ) {
+        $text = "";
+        $id   = '';
+        $id2  = '';
+    }
+    my $ll = 1 + length $value;
+
+    my $vl;
+    my $run = "";
+    while( ( $vl = length $value ) && $vl < $ll ) {
+        $ll = $vl;
+        $value =~ s/^\s+//;
+
+        # QSTR
+        if( $value =~ s/^["]((?:\\["]|[^"])+)["]\s*// ) {
+            my $txt = $1;
+            if( defined $txt && length $txt ) {
+                $txt =~ s/\\(.)/$1/g;
+                $txt =~ s/\\(.)/$1/g if( $dblenc );
+                $run .= ' ' if( length $run );
+                $run .= qq("$txt");
+            }
+            next;
+        }
+
+        # non-QSTR, non-TAG
+        if( $value =~ s/^([^["]+)\s*(\[|["]|$)/$2/ ) {
+            my $txt = $1;
+            if( defined $txt && length $txt ) {
+                $run .= ' ' if( length $run );
+                $run .= $txt;
+            }
+            next;
+        }
+
+        # [TAG QSTR]
+        if( $value =~ s/^\s*\[(\S+)\s["]((?:\\["]|[^"])*)["]\]// ) {
+            my( $t, $tv ) = ( $1, $2 );
+            if( length $run ) {
+                $text .= join( '', wrap( $id2, $id2, $run ), "\n" );
+                $run = "";
+            }
+            next if( $notags );
+            $t = sprintf( "$id%-14s: ", $t );  # 14+2
+            $tv =~ s/\\(.)/$1/g;
+            $tv =~ s/\\(.)/$1/g if( $dblenc );
+            $text .= join( '', wrap( $t, ( ' ' x length $t ), $tv ), "\n" );
+            next;
+        }
+
+        # [TAG NQSTR]
+        if( $value =~ s/^\s*\[(\S+)\s([^\]]+)\]// ) {
+            if( length $run ) {
+                $text .= join( '', wrap( $id2, $id2, $run ), "\n" );
+                $run = "";
+            }
+            next if( $notags );
+            my( $t, $tv ) = ( $1, $2 );
+            $t = sprintf( "$id%-14s: ", $t );  # 14+2
+            $text .= join( '', wrap( $t, ( ' ' x length $t ), $tv ), "\n" );
+            next;
+        }
+
+        $value =~ s/\s+$//;
+    }
+    if( length $run ) {
+        $text .= join( '', wrap( $id2, $id2, $run ), "\n" );
+    }
+
+    # Truncated remainder - don't know if it's quoted...
+    if( length $value ) {
+        $text .= join( '', wrap( $id2, $id2, $value ), "\n" );
+    }
+    if( $notags ) {
+        $text =~ s/\n/ /g;
+        $text =~ s/\s+$//;
+    }
+    return $text;
+}
+
+# Resolve an IP address to a name/names
+#
+# Net::DNS is required for the case of an IP address with multiple PTRs
+# Otherwise, whatever getaddrinfo() returns is used.
+#
+# A cache is maintained - duplicate requests are guaranteed for the
+# summary and likely otherwise.
+
+sub ipname {
+    my( $ip ) = @_;
+
+    return $ip unless( $names );
+
+    my $name;
+
+    $name = $names{$ip} and return $name;
+
+    if( $netdns ) {
+        my @names;
+
+        $ns ||= Net::DNS::Resolver->new( recurse        => 1, persistent_tcp => 1,
+                                         persistent_udp => 1 );
+
+        my $rpy = $ns->send( $ip, 'PTR' );
+        foreach my $rr ( grep { $_->type eq 'PTR' } $rpy->answer ) {
+            push @names, $rr->ptrdname;
+        }
+        if( @names ) {
+            $name = join( ', ', @names );
+        } else {
+            $name = $ip;
+        }
+    } else {
+        my( $err, @addrs );
+        ( $err, @addrs ) = getaddrinfo(
+            $ip, undef,
+            { flags => AI_NUMERICHOST, protocol => IPPROTO_TCP } );
+        if( $err || !@addrs ) {
+            $name = $ip;
+        } else {
+            ( $err, $name ) = getnameinfo( $addrs[0]->{addr}, 0, NIx_NOSERV );
+            $name = $ip unless( $name );
+        }
+    }
+    $names{$ip} = $name;
+    return $name;
+}
+
+__END__
+
+
+=pod
+
+=head1 NAME
+
+modsec_logview - Summarizes or decodes mod_security audit logs.
+
+=head1 SYNOPSIS
+
+ modsec_logview --root=DIR    --hostnames  --help --man   --version [file ...]
+                --extract=IDs --date       --utc  --width --only-modsec-events
+
+=head1 DESCRIPTION
+
+I<modsec_logview> reads and decodes the entries in mod_security2
+audit logs.
+
+By default, produces a a summary suitable for quickly finding and
+adding SecRuleRemoveById for false positives.
+
+With B<--extract>, will extract and (nearly) fully-decode specified
+entries from the audit log.
+
+=head1 OPTIONS
+
+The following options are provided.  The short and long forms of
+each option have the same effect.  The long form of a boolean
+option can be negated by specifying it as B<-->noB<OPTION>.
+
+=over 4
+
+=item B<-d> B<--date>
+
+Include the date in summary reports.  (Omitting it saves space.)
+These dates are reformatted to provide the day of the week and omit
+seconds.  They are displayed in local time (converted if B<--utc> is
+also specified.
+
+This converion is only done for the summary report; B<--extract>
+displays dates as recorded.
+
+=item B<-u> B<--utc>
+
+Logged dates are UTC.  B<--noutc> is local time.
+
+=item B<-e> B<--extract>=ID
+
+Extract and report a specific audit log entry.  The ID can be
+obtained from the (default) summary report.
+
+B<--extract> can be specified more than once, and the ID can be
+a comma-separated list.
+
+=item B<-n> B<--hostnames>
+
+Convert IP addresses to host names where possible.  This may be
+slow.  For the most complete answers, F<Net::DNS> must be installed.
+
+=item B<-m> B<--only-modsec-events>
+
+Only report on events with a mod_security message in the summary
+This excludes Apache-Error events, which can be voluminous and
+not particulary informative.  (e.g. "Re-negotiation handshake failed").
+
+=item B<r> B<--root>
+
+Specifies the root directory  used when a filename is specified
+with a relative path.  The default is F</var/log/httpd>.
+
+Note that if a filename includes wildcards, it may need to be
+quoted to get past the shell's expansion.  Wildcards will be
+expanded for each input file after relative paths have been
+resolved.
+
+=item B<-w> B<--width>=NUM
+
+Specifies the desired output width for the summary report.  This
+is a best-efforts value; if the required fields consume more than
+the specified width, the output may exceed the request.
+
+The goal of the summary report is to report the key facets of each event
+on a single line.
+
+With B<--date>, the minimum output width is about 105 characters; without
+it the minimum is about 85 characters.
+
+Fields will be truncated to fit the available space; a wider
+terminal will allow more information to be seen.  Of the variable
+width fields, Numbric IP addresses have the highest priority for space;
+up to half the remainder can be allocated to the message and url.
+
+If line length is not a concern, specify a large value, such as 1_000_000.
+
+If not specified, B<--width> defaults to your terminal width, if it can
+be determined.  Otherwise, the B<COLUMNS> environment variable, and if that
+is undefined, 132.
+
+A minimum value of 80 or 90 is enforced depending on whether B<--date> is
+specified.
+
+=item B<--help>
+
+Display summary usage information.
+
+=item B<--man>
+
+Display complete usage information.
+
+=item B<--version>
+
+Display version
+
+=back
+
+=head1 RETURN VALUE
+
+The exit value is 0 if no errors.
+
+=head1 FILES
+
+Only the input files are used.
+
+Socket, a core module, must be version 2.000 or higher.  If this
+module is upgraded (available on CPAN), Perls as old as 5.8.8
+should support this code.
+
+The Net::DNS and Term::ReadKey packages, also available from CPAN,
+are optional, but recommended.
+
+=head1 BUGS
+
+Report any bugs, feature requests and/or patches to the author.
+
+=head1 AUTHOR
+
+Timothe Litt  E<lt>litt@acm.orgE<gt>
+
+=head1 COPYRIGHT and LICENSE
+
+Copyright (c) 2019 Timothe Litt
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+Except as contained in this notice, the name of the author shall not be
+used in advertising or otherwise to promote the sale, use or other dealings
+in this Software without prior written authorization from the author.
+
+Any modifications to this software must be clearly documented by and
+attributed to their author, who is responsible for their effects.
+
+Bug reports, suggestions and patches are welcomed by the original author.
+
+=head1 SEE ALSO
+
+I<httpd(8)> I<mod_security2> I<Net::DNS> I<Term::ReadKey>
+
+=cut
+
+
+
