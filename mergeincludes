@@ -8,7 +8,7 @@ Copyright (C) 2019 Timothe Litt <litt at acm.org>
 Use --man for license information.
 COPYRIGHT
 
-our $VERSION = '0.001';
+our $VERSION = '0.002';
 
 # Iterate over in-use config file, with listing or command execution.
 
@@ -59,7 +59,7 @@ if( defined $root ) {
     $server_root = $root;
 } elsif( defined( my $cfg = qx,httpd -V -f /dev/null 2>/dev/null, ) ) { # Get from httpd, suppress "no MPM"
     if( defined $cfg ) {
-        my( undef, $cr ) = $cfg =~ /^\s*-D\s*HTTPD_ROOT=(["'])?((?:\\\1|[^\1]\n)+?)\1\n/ms;
+        my( undef, $cr ) = $cfg =~ /^\s*-D\s*HTTPD_ROOT=(["'])?((?:\\\1|[^\1\n])+?)\1\n/ms;
         my( undef, $cf ) = $cfg =~ /^\s*-D\s*SERVER_CONFIG_FILE=(["'])?((?:\\\1|[^\1\n])+?)\1\n/ms;
         $server_root = $cr if( $cr );
         push @ARGV, $cf if( $cf && !@ARGV );
@@ -83,7 +83,7 @@ while( @ARGV ) {
         my $root = $server_root;
         my( $rv, $idt ) = process( $pn, $root, 0 );
         $xit ||= $rv;
-        unless( $quiet ) {
+        unless( $quiet || !defined $idt ) {
             print( $idt ) if( $number );
             printf( "#-%s\n", $pn );
         }
@@ -92,114 +92,153 @@ while( @ARGV ) {
 exit( $xit || 0 );
 
 sub process {
-    my( $fn, $root, $depth, $optional ) = @_;
-
-    die( "Include from a directory ($fn) is not supported\n" ) if( -d $fn );
+    my( $fn, $root, $depth, $optional, $dir ) = @_;
 
     my $indent = sprintf( "%2u: %s", $depth, ' ' x $depth );
+    my $isdir;
 
-    print( $indent ) if( $number && !$quiet );
-    printf( "#+%s", $fn ) unless( $quiet );
+    my @files;
+    if( -d $fn ) {
+        die( "Include from a directory ($fn) is not supported\n" ) unless( $dir );
+        $isdir = 1;
 
-    my( $fh, $rp );
-    if( $fn eq '-' ) {
-        $fh = \*stdin;
-    } else {
+        @files = glob "$fn/*";
+
         unless( File::Spec->file_name_is_absolute( $fn ) ) {
             $fn = File::Spec->catfile( $root, $fn );
         }
-        open( $fh, '<', $fn ) or do {
-            unless( $quiet ) {
-                print( " (optional)" ) if( $optional );
-                print( "\n", $indent, "$fn: $!\n" );
-            }
-            print STDERR ( "\n", $indent, "$fn: $!\n" );
-            return ( 1, $indent );
-        };
-        $rp = realpath( $fn );
-        printf( ' => %s', $rp ) if( !$quiet && ( $rp ne $fn || $rp ne $_[0] ) );
+        print( $indent ) if( $number && !$quiet );
+        printf( "#+%s [dir]\n", $fn ) unless( $quiet );
+        ++$depth;
+    } else {
+        @files = ( $fn, );
     }
-    unless( $quiet ) {
-        print( " (optional)" ) if( $optional );
-        print( "\n" );
-    }
+    return unless( @files );
 
-    foreach my $execute ( @execute ) {
-        my $cmd = $execute;
-        my $rc;
-        if( $rp && $chdir ) {
-            my $wd = getcwd;
-            my $xd = dirname( $fn );
-            chdir( $xd ) or die( "$xd: $!\n" );
-            my $xn = basename( $fn );
-            $cmd =~ s/\{\}/$xn/g;
-            $rc = system( $cmd );
-            local $!;
-            chdir( $wd ) or die( "$wd: $!\n" );
+    foreach my $fn (@files) {
+        my $indent = sprintf( "%2u: %s", $depth, ' ' x $depth );
+
+        print( $indent ) if( $number && !$quiet );
+        printf( "#+%s", $fn ) unless( $quiet );
+
+        my( $fh, $rp );
+        if( $fn eq '-' ) {
+            $fh = \*stdin;
         } else {
-            my $xp = $fn;
-            $cmd =~ s/\{\}/$fn/g;
-            $rc = system( $cmd );
-        }
-        unless( $rc == 0 ) {
-            if( $? == -1 ) {
-                printf STDERR ( "%s: failed to execute: %s\n", $cmd, $! );
-            } elsif( $? & 127 ) {
-                printf STDERR (
-                    "%s: died with signal %d, %s coredump\n", $cmd,
-                    ( $? & 127 ), ( $? & 128 ) ? 'with' : 'without' );
-            } else {
-                printf STDERR ( "%s: exited with status %d\n", $cmd, $? >> 8 );
+            unless( File::Spec->file_name_is_absolute( $fn ) ) {
+                $fn = File::Spec->catfile( $root, $fn );
             }
-            exit( $? >> 8 ) unless( $continue );
-        }
-        $xit ||= $? >> 8;
-    }
-
-    my $line = '';
-    while( <$fh> ) {
-        $_ .= "\n" unless( substr( $_, -1, 1 ) eq "\n" );
-        if( $number && !@execute ) {
-            printf( "$indent%4u:%s", $., $_ );
-        } else {
-            print;
-        }
-        s/\015?\012//;         # chomp (with cr)
-        $line =~ s/\\?\z/$_/;  # Remove continuation & append new
-        next if( s/\\\z// );   # This line a continuation.
-        $_ = $line;            # Expanded line, not continued
-        $line = '';            # Initialize next line
-        next if( /^\s*#/ );    # Comment (httpd comments ARE continued.)
-        next if( /^\s*$/ );    # Blank
-
-        if( /^\s*ServerRoot\s+(["'}?])([^\1]*)\1\s*$/i ) {
-            $_[1] = $root = $2;
-            next;
-        }
-        my $inc;
-        /^\s*Include(Optional)?\s+(["'}?])([^\2]*)\2\s*$/i and
-            $inc = $3 or
-            /^\s*Include\s+(\S+)s*$/i and
-            $inc = $1;
-        my $opt = $1;
-
-        if( defined $inc ) {
-            foreach my $pn ( glob $inc ) {
-                my( $rv, $idt ) = process( $pn, $root, $depth + 1, $opt );
-                $xit ||= $rv;
+            open( $fh, '<', $fn ) or do {
                 unless( $quiet ) {
-                    print( $idt ) if( $number );
-                    printf( "#-%s\n", $pn );
+                    print( " (optional)" ) if( $optional );
+                    print( "\n", $indent, "$fn: $!\n" );
+                }
+                print STDERR ( "\n", $indent, "$fn: $!\n" );
+                return ( 1, $indent );
+            };
+            $rp = realpath( $fn );
+            printf( ' => %s', $rp ) if( !$quiet && ( $rp ne $fn || $rp ne $_[0] ) );
+        }
+        unless( $quiet ) {
+            print( " (optional)" ) if( $optional );
+            print( "\n" );
+        }
+
+        foreach my $execute ( @execute ) {
+            my $cmd = $execute;
+            my $rc;
+            if( $rp && $chdir ) {
+                my $wd = getcwd;
+                my $xd = dirname( $fn );
+                chdir( $xd ) or die( "$xd: $!\n" );
+                my $xn = basename( $fn );
+                $cmd =~ s/\{\}/$xn/g;
+                $rc = system( $cmd );
+                local $!;
+                chdir( $wd ) or die( "$wd: $!\n" );
+            } else {
+                my $xp = $fn;
+                $cmd =~ s/\{\}/$fn/g;
+                $rc = system( $cmd );
+            }
+            unless( $rc == 0 ) {
+                if( $? == -1 ) {
+                    printf STDERR ( "%s: failed to execute: %s\n", $cmd, $! );
+                } elsif( $? & 127 ) {
+                    printf STDERR (
+                                   "%s: died with signal %d, %s coredump\n", $cmd,
+                                   ( $? & 127 ), ( $? & 128 ) ? 'with' : 'without' );
+                } else {
+                    printf STDERR ( "%s: exited with status %d\n", $cmd, $? >> 8 );
+                }
+                exit( $? >> 8 ) unless( $continue );
+            }
+            $xit ||= $? >> 8;
+        }
+
+        my $line = '';
+        while( <$fh> ) {
+            $_ .= "\n" unless( substr( $_, -1, 1 ) eq "\n" );
+            if( $number && !@execute ) {
+                printf( "$indent%4u:%s", $., $_ );
+            } else {
+                print;
+            }
+            s/\015?\012//;         # chomp (with cr)
+            $line =~ s/\\?\z/$_/;  # Remove continuation & append new
+            next if( s/\\\z// );   # This line a continuation.
+            $_ = $line;            # Expanded line, not continued
+            $line = '';            # Initialize next line
+            next if( /^\s*#/ );    # Comment (httpd comments ARE continued.)
+            next if( /^\s*$/ );    # Blank
+
+            if( /^\s*ServerRoot\s+(["'}?])([^\1]*)\1\s*$/i ) {
+                $_[1] = $root = $2;
+                next;
+            }
+            my $inc;
+            /^\s*Include(Optional)?\s+(["'}?])([^\2]*)\2\s*$/i and
+              $inc = $3 or
+                /^\s*Include\s+(\S+)s*$/i and
+                  $inc = $1;
+            my $opt = $1;
+
+            if( defined $inc ) {
+                if( -d $inc ) {
+                    foreach my $pn ( glob "$inc/*" ) {
+                        my( $rv, $idt ) = process( $pn, $root, $depth + 1, $opt, 1 );
+                        $xit ||= $rv;
+                        unless( $quiet || !defined $idt ) {
+                            print( $idt ) if( $number );
+                            printf( "#-%s\n", $pn );
+                        }
+                    }
+                } else {
+                    foreach my $pn ( glob $inc ) {
+                        my( $rv, $idt ) = process( $pn, $root, $depth + 1, $opt );
+                        $xit ||= $rv;
+                        unless( $quiet || !defined $idt ) {
+                            print( $idt ) if( $number );
+                            printf( "#-%s\n", $pn );
+                        }
+                    }
+                }
+                unless( $quiet ) {
+                    print( $indent ) if( $number );
+                    printf( "#=%s\n", $fn );
                 }
             }
-            unless( $quiet ) {
-                print( $indent ) if( $number );
-                printf( "#=%s\n", $fn );
-            }
         }
+        printf STDERR ( "%s: continuation open at end of file (line %u)\n", $fn, $. ) if( length $line && !$quiet );
+        close( $fh );
     }
-    printf STDERR ( "%s: continuation open at end of file (line %u)\n", $fn, $. ) if( length $line && !$quiet );
-    close( $fh );
+    if( $isdir ) {
+        unless( $quiet ) {
+            print( $indent ) if( $number );
+            printf( "#-%s [dir]\n", $fn );
+        }
+        undef $indent;
+    }
     return ( 0, $indent );
 }
 
@@ -334,7 +373,7 @@ Timothe Litt  E<lt>litt@acm.orgE<gt>
 
 =head1 COPYRIGHT and LICENSE
 
-Copyright (c) 2019 Timothe Litt
+Copyright (c) 2019 - 2020 Timothe Litt
 
 Permission is hereby granted, free of charge, to any person obtaining a
 copy of this software and associated documentation files (the "Software"),
